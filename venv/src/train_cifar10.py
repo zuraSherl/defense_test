@@ -21,6 +21,33 @@ CIFAR10_Training_Parameters = {
     'lr': 1e-3
 }
 
+# MMA的CIFAR10训练参数
+MMA_CIFAR10_Training_Parameters = {
+    'num_epochs': 200,
+    'batch_size': 128,
+    'lr': 0.3,
+    'momentum': 0.9,
+    'decay': 0.0002
+}
+
+# 调整CIFAR10训练过程中的学习率
+def adjust_mma_learning_rate(epoch, optimizer):
+    # optimizer.param_groups：优化器对象的超参数
+    for param_group in optimizer.param_groups:
+        lr_temp = param_group["lr"]
+        # 如果epoch的次数达到一定值时，进行学习率的调整
+        if epoch < 80:
+            lr_temp = 0.3
+        elif epoch < 120:
+            lr_temp = 0.09
+        elif epoch < 160:
+            lr_temp = 0.03
+        else:
+            lr_temp = 0.009
+        # 将调整后的学习率写入到优化器中
+        param_group["lr"] = lr_temp
+        print('The **learning rate** of the {} epoch is {}'.format(epoch, param_group["lr"]))
+
 # 调整学习率
 def adjust_learning_rate(epoch, optimizer):
     # 最小的学习率
