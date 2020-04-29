@@ -36,13 +36,11 @@ def adjust_mma_learning_rate(epoch, optimizer):
     for param_group in optimizer.param_groups:
         lr_temp = param_group["lr"]
         # 如果epoch的次数达到一定值时，进行学习率的调整
-        if epoch < 80:
-            lr_temp = 0.3
-        elif epoch < 120:
+        if epoch == 80:
             lr_temp = 0.09
-        elif epoch < 160:
+        elif epoch == 120:
             lr_temp = 0.03
-        else:
+        elif epoch == 160:
             lr_temp = 0.009
         # 将调整后的学习率写入到优化器中
         param_group["lr"] = lr_temp

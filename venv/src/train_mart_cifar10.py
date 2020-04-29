@@ -29,13 +29,13 @@ def adjust_CIFAR10_learning_rate(epoch, optimizer):
     minimum_learning_rate = 0.5e-6
     # optimizer.param_groups：优化器对象的超参数
     for param_group in optimizer.param_groups:
-        lr_temp = param_group["lr"]
+        lr_temp = param_group["learning_rate"]
         # 如果epoch的次数达到一定值时，进行学习率的调整
         if epoch == 75 or epoch == 90:
             lr_temp = lr_temp * 0.1
         # 将调整后的学习率写入到优化器中
-        param_group["lr"] = max(lr_temp, minimum_learning_rate)
-        print('The **learning rate** of the {} epoch is {}'.format(epoch, param_group["lr"]))
+        param_group["learning_rate"] = max(lr_temp, minimum_learning_rate)
+        print('The **learning rate** of the {} epoch is {}'.format(epoch, param_group["learning_rate"]))
 
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_index
