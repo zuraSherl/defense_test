@@ -75,7 +75,7 @@ class UAPATDefense(Defense):
             nat_labels = labels.to(self.device)
             self.model.eval()
             # 为训练集产生对抗样本
-            adv_images = nat_images + universal_perturbation
+            adv_images = np.clip(nat_images + universal_perturbation,0.0,1.0)
             self.model.train()
             # 干净样本的损失函数
             logits_nat = self.model(nat_images)
