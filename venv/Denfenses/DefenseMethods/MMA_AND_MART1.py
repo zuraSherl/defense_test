@@ -319,37 +319,6 @@ def bisection_search(cur_eps, ptb, model, data, label, fn_margin, margin_init,ma
     # 返回最佳扰动
     return cur_eps
 
-# 复制梯度
-class GradCloner(object):
-    def __init__(self, model, optimizer):
-        # model：模型
-        # optimizer：优化器
-        self.model = model
-        self.optimizer = optimizer
-        # clone_model：复制模型
-        self.clone_model = copy.deepcopy(model)
-        # clone_optimizer：设置复制优化器为SGD，lr=0.0
-        self.clone_optimizer = optim.SGD(self.clone_model.parameters(), lr=0.)
-
-    # 复制和清空梯度
-    def copy_and_clear_grad(self):
-        # 初始化复制优化器的梯度为0
-        self.clone_optimizer.zero_grad()
-        # 将复制优化器的梯度赋值为原始优化器的梯度
-        for (pname, pvalue), (cname, cvalue) in zip(self.model.named_parameters(), self.clone_model.named_parameters()):
-            cvalue.grad = pvalue.grad.clone()
-        # 将原始优化器的梯度清空
-        self.optimizer.zero_grad()
-
-    # 更新原始优化器的梯度为组合梯度
-    def combine_grad(self, alpha=1, beta=1):
-        # alpha：原始优化器梯度的系数，默认为1
-        # beta：复制优化器梯度的系数，默认为1
-        for (pname, pvalue), (cname, cvalue) in zip(self.model.named_parameters(), self.clone_model.named_parameters()):
-            # 原始优化器梯度 = alpha*原始优化器的梯度 + beta*复制优化器的梯度
-            pvalue.grad.data = \
-                alpha * pvalue.grad.data + beta * cvalue.grad.data
-
 # 计算平均精度
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -416,7 +385,7 @@ def update_eps_meter(meter, eps, num):
     meter["disp_eps"].update(eps, num)
 
 # MMA防御
-class OriginMMADefense(Defense):
+class MMAANDMART1Defense(Defense):
     def __init__(self, loader, dataname="train", verbose=True, model=None, defense_name=None, dataset=None, training_parameters=None, device=None, **kwargs):
         # model：模型
         # defense_name：防御名称
@@ -428,7 +397,7 @@ class OriginMMADefense(Defense):
         # verbose：默认为True
         # dct_eps：记录当前扰动
         # dct_eps_record：记录每个epoch的扰动
-        super(OriginMMADefense, self).__init__(model=model, defense_name=defense_name)
+        super(MMAANDMART1Defense, self).__init__(model=model, defense_name=defense_name)
         self.model = model
         self.defense_name = defense_name
         self.device = device
@@ -447,11 +416,6 @@ class OriginMMADefense(Defense):
         self.loader.targets = self.loader.targets.to(self.device)
         # self.model.to(self.device)
 
-        # add_clean_loss：是否添加正确分类样本的损失，大于0为True，小于等于0为False
-        self.add_clean_loss = self.clean_loss_coeff > 0
-        # 如果要添加正确分类的损失，则将模型和优化器传入GradCloner中
-        if self.add_clean_loss:
-            self.grad_cloner = GradCloner(self.model, self.optimizer)
         # 交叉熵损失的原损失
         self.margin_loss_fn1 =  get_none_loss_fn(self.margin_loss_fn)
         # 交叉损失的平均损失（为loss_fn）
@@ -511,15 +475,14 @@ class OriginMMADefense(Defense):
         self.test_eps_iter = kwargs['test_eps_iter']
         # 损失函数
         self.clean_loss_fn = kwargs['clean_loss_fn']
-        self.margin_loss_fn = kwargs['margin_loss_fn']
         self.attack_loss_fn = kwargs['attack_loss_fn']
         self.search_loss_fn = kwargs['search_loss_fn']
         # ANPGD添加的最大扰动，为论文中的dmax
         self.hinge_maxeps = kwargs['hinge_maxeps']
         # ANPGD的搜索次数
         self.num_search_steps = kwargs['num_search_steps']
-        # 损失函数的系数
-        self.clean_loss_coeff = kwargs['clean_loss_coeff']
+        # MART的正则化项系数
+        self.lamda = kwargs['lamda']
         # 其他参数
         self.disp_interval = kwargs['disp_interval']
         return True
@@ -659,76 +622,70 @@ class OriginMMADefense(Defense):
         self.model.eval()
         # 经过模型的训练集的logit输出
         clnoutput = self.model(data)
-        # 对干净训练集求平均交叉熵损失
-        clnloss = self.loss_fn(clnoutput, target)
-        # 是否添加净损失
-        if self.add_clean_loss:
-            # 清空优化器梯度
-            self.optimizer.zero_grad()
-            # 反向传播
-            clnloss.backward()
-            # 复制原始优化器梯度，再清空原始优化器梯度
-            self.grad_cloner.copy_and_clear_grad()
-        # 对干净训练集计算SLM原损失
-        search_loss = self.search_loss_fn1(clnoutput, target)
-        # 正确分类的图像slm损失小于0
-        cln_correct = (search_loss < 0)
-        # 错误分类的图像的slm损失大于等于0
-        cln_wrong = (search_loss >= 0)
-        # 获取正确分类的图像
-        data_correct = data[cln_correct]
-        # 获取正确分类的标签
-        target_correct = target[cln_correct]
-        # 获取正确分类的图像在data中的下标
-        idx_correct = idx[cln_correct]
-        # 计算所有分类正确的data数量
-        num_correct = cln_correct.sum().item()
-        # 计算所有错误分类的数量
-        num_wrong = cln_wrong.sum().item()
-        # 初始化当前的扰动为0，shape与len(data)相同
-        curr_eps = data.new_zeros(len(data))
-
-        # 如果正确分类的图片数目大于0
-        if num_correct > 0:
-            # 获取分类正确图片的PGD初始扰动范围
-            prev_eps = self.get_eps(idx_correct, data)
-            # 利用ANPGD，返回ANPGD对抗样本和最佳扰动
-            advdata_correct, curr_eps_correct = self.anpgd_generation(data_correct, target_correct, prev_eps)
-            # 用ANPGD对抗样本替换正确分类的样本，更新data
-            data[cln_correct] = advdata_correct
-            # 更新正确分类样本添加的扰动，错误分类的保持为0
-            curr_eps[cln_correct] = curr_eps_correct
-        # 模型预测输出（正确分类的添加ANPGD扰动后的分类结果，错误分类则为原样本的分类结果）
-        mmaoutput = self.model(data)
-        # 如果没有正确分类的样本，则令正确分类样本的交叉损失熵为0
-        if num_correct == 0:
-            marginloss = mmaoutput.new_zeros(size=(1,))
-        # 否则求正确分类样本添加ANPGD扰动后的交叉熵损失
-        else:
-            marginloss = self.margin_loss_fn1(mmaoutput[cln_correct], target[cln_correct])
-        # 如果错误分类的数量为0，则错误分类的loss为0
-        if num_wrong == 0:
-            clsloss = 0.
-        # 否则为错误分类样本的交叉熵损失
-        else:
-            clsloss = self.loss_fn(mmaoutput[cln_wrong], target[cln_wrong])
-        # 如果有正确分类的样本，仅取小于dmax的扰动的交叉熵损失
-        if num_correct > 0:
-            marginloss = marginloss[self.hinge_maxeps > curr_eps_correct]
-        # 求平均MMA损失
-        mmaloss = (marginloss.sum() + clsloss * num_wrong) / len(data)
-        # 清空梯度
+        # 产生ANPGD对抗样本
+        prev_eps = self.get_eps(idx, data)
+        advdata, curr_eps = self.anpgd_generation(data, target, prev_eps)
+        # 预测对抗样本标签
+        advoutput = self.model(advdata)
+        # MART损失函数（直接将错误分类样本的损失作为正则化项）
+        # 第一个指标函数BCE
+        loss_adv1 = self.loss_fn(advoutput, target)
+        softm_adv = F.softmax(advoutput, dim=1)
+        inf = -float('inf')
+        for i in range(advoutput.shape[0]):
+            advoutput[i][target[i]] = inf
+        _, predicted = torch.max(advoutput.data, 1)
+        predicted = predicted.numpy()
+        one_hot_labels = []
+        for label in predicted:
+            one_hot_label = [0 for i in range(10)]
+            one_hot_label[label] = 1
+            one_hot_labels.append(one_hot_label)
+        one_hot_labels = np.array(one_hot_labels)
+        one_hot_labels = torch.from_numpy(one_hot_labels)
+        log_one = torch.sum(torch.mul(one_hot_labels, softm_adv), dim=1)
+        log_one = torch.ones(log_one.shape) - log_one
+        log_likelihood = -torch.log(log_one)
+        loss_adv11 = torch.mean(log_likelihood)
+        loss_adv_bce = loss_adv1 + loss_adv11
+        # 第二个指标函数BCE
+        loss_nat1 = self.loss_fn(clnoutput, target)
+        softm_nat = F.softmax(clnoutput, dim=1)
+        for i in range(clnoutput.shape[0]):
+            clnoutput[i][target[i]] = inf
+        m, predicted_nat = torch.max(clnoutput.data, 1)
+        predicted_nat = predicted_nat.numpy()
+        one_hot_labels1 = []
+        for label1 in predicted_nat:
+            one_hot_label1 = [0 for i in range(10)]
+            one_hot_label1[label1] = 1
+            one_hot_labels1.append(one_hot_label1)
+        one_hot_labels1 = np.array(one_hot_labels1)
+        one_hot_labels1 = torch.from_numpy(one_hot_labels1)
+        log_one1 = torch.sum(torch.mul(one_hot_labels1, softm_nat), dim=1)
+        log_one1 = torch.ones(log_one1.shape) - log_one1
+        log_likelihood1 = -torch.log(log_one1)
+        loss_nat11 = torch.mean(log_likelihood1)
+        loss_nat_bce = loss_nat1 + loss_nat11
+        # 第三个指标函数
+        one_hot_nat_labels = []
+        for nat_label in target:
+            one_hot_nat_label = [0 for i in range(10)]
+            one_hot_nat_label[nat_label] = 1
+            one_hot_nat_labels.append(one_hot_nat_label)
+        one_hot_nat_labels = np.array(one_hot_nat_labels)
+        one_hot_nat_labels = torch.from_numpy(one_hot_nat_labels)
+        pyi = torch.sum(torch.mul(softm_nat, one_hot_nat_labels), dim=1)
+        loss3 = torch.ones(pyi.shape) - pyi
+        loss3 = torch.mean(loss3)
+        # 总的损失函数
+        loss = loss_adv_bce + self.lamda * loss_nat_bce * loss3
         self.optimizer.zero_grad()
-        # 反向传播
-        mmaloss.backward()
-        # 组合梯度，1/3净损失+2/3MMA损失
-        if self.add_clean_loss:
-            self.grad_cloner.combine_grad(1 - self.clean_loss_coeff, self.clean_loss_coeff)
-        # 梯度更新
+        loss.backward()
         self.optimizer.step()
         # 更新dct_eps和dct_eps_record
         self.update_eps(curr_eps, idx)
-        # 返回经过模型一个batch的logit输出、训练集的平均交叉熵损失和当前扰动（0/ANPGD扰动）
+        # 返回经过模型一个batch的logit输出、训练集的平均交叉熵损失和当前扰动（ANPGD扰动）
         return clnoutput, clnloss, curr_eps
 
     # 初始化meters（OrderedDict会保留字典的添加顺序）
@@ -1030,37 +987,5 @@ class OriginMMADefense(Defense):
                 self.model.save(name=defense_enhanced_saver)
             else:
                 print('Train Epoch{:>3}: Average correct ANPGD perturbation did not improve from {:.4f}\n'.format(epoch, best_avgeps))
-
-
-
-
-
-
-
-    # # 保存在验证集上最好分类精度的MMA对抗训练模型
-    # def defense(self, validation_loader=None):
-    #     # train_loader：训练集
-    #     # validation_loader：验证集
-    #     # best_val_acc：验证集上的最佳分类精度
-    #     best_val_acc = None
-    #     for epoch in range(self.num_epochs):
-    #         self.train_one_epoch()
-    #         # 计算验证集精度
-    #         val_acc = validation_evaluation(model=self.model, validation_loader=validation_loader, device=self.device)
-    #         # 调整学习率
-    #         if self.Dataset == 'CIFAR10':
-    #             adjust_mma_learning_rate(epoch=epoch, optimizer=self.optimizer)
-    #         # 将最佳模型参数保存到DefenseEnhancedModels/OriginMMA/CIFAR10_OriginMMA_enhanced.pt中或MNIST
-    #         assert os.path.exists('../DefenseEnhancedModels/{}'.format(self.defense_name))
-    #         defense_enhanced_saver = '../DefenseEnhancedModels/{}/{}_{}_enhanced.pt'.format(self.defense_name, self.Dataset, self.defense_name)
-    #         # 将最好的模型参数进行保存
-    #         if not best_val_acc or round(val_acc, 4) >= round(best_val_acc, 4):
-    #             if best_val_acc is not None:
-    #                 os.remove(defense_enhanced_saver)
-    #             best_val_acc = val_acc
-    #             self.model.save(name=defense_enhanced_saver)
-    #         else:
-    #             print('Train Epoch{:>3}: validation dataset accuracy did not improve from {:.4f}\n'.format(epoch, best_val_acc))
-
 
 

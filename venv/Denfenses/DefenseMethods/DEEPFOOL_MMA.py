@@ -473,7 +473,7 @@ class DEEPFOOLMMADefense(Defense):
         # ANPGD添加的最大扰动，为论文中的dmax
         self.hinge_maxeps = kwargs['hinge_maxeps']
         # ANPGD的搜索次数
-        self.num_search_steps = kwargs['num_search_steps']
+        # self.num_search_steps = kwargs['num_search_steps']
         # 损失函数的系数
         self.clean_loss_coeff = kwargs['clean_loss_coeff']
         # 其他参数
@@ -625,13 +625,13 @@ class DEEPFOOLMMADefense(Defense):
             marginloss = mmaoutput.new_zeros(size=(1,))
         # 否则求正确分类样本添加ANPGD扰动后的交叉熵损失
         else:
-            marginloss = margin_loss_fn(mmaoutput[cln_correct], target[cln_correct])
+            marginloss = self.margin_loss_fn1(mmaoutput[cln_correct], target[cln_correct])
         # 如果错误分类的数量为0，则错误分类的loss为0
         if num_wrong == 0:
             clsloss = 0.
         # 否则为错误分类样本的交叉熵损失
         else:
-            clsloss = clean_loss_fn(mmaoutput[cln_wrong], target[cln_wrong])
+            clsloss = self.loss_fn(mmaoutput[cln_wrong], target[cln_wrong])
         # 如果有正确分类的样本，仅取小于dmax的扰动的交叉熵损失
         if num_correct > 0:
             marginloss = marginloss[self.hinge_maxeps > curr_eps_correct]
@@ -930,11 +930,11 @@ class DEEPFOOLMMADefense(Defense):
                 np.array(list(self.dct_eps_test.values())).mean())
 
     def test_defense(self, validation_loader=None):
-        # 初始化最大ANPGD平均扰动为0.0
+        # 初始化最大DeepFool平均扰动为0.0
         best_avgeps = 0.
         for epoch in range(self.num_epochs):
             self.train_one_epoch()
-            # 验证集的平均精度、白盒攻击PGD对抗样本的平均精度、需要添加的平均ANPGD扰动
+            # 验证集的平均精度、白盒攻击PGD对抗样本的平均精度、需要添加的平均DeepFool扰动
             val_clnacc, val_advacc, val_avgeps = self.test_one_epoch(dataname='valid', loader=validation_loader)
             # 如果是CIFAR10数据集，则调整模型参数
             if self.Dataset == 'CIFAR10':

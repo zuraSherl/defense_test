@@ -11,6 +11,7 @@ import numpy as np
 import torch.optim as optim
 from Denfenses.DefenseMethods.defenses import Defense
 from src.train_cifar10 import adjust_mma_learning_rate
+from attacks.DEEPFOOL_Generation import DeepFoolAttack
 
 # 为训练集/测试集的分组进行编号(0~len(loader.targets)-1)
 def add_indexes_to_loader(loader):
@@ -277,79 +278,6 @@ def get_mean_loss_fn(name):
 def get_none_loss_fn(name):
     return get_loss_fn(name, "none")
 
-# 搜索函数，返回ANPGD最佳扰动
-def bisection_search(cur_eps, ptb, model, data, label, fn_margin, margin_init,maxeps, num_steps,
-        cur_min=None, clip_min=0., clip_max=1.):
-    # cur_eps：pgd攻击的扰动范围
-    # ptb：pgd攻击的扰动方向
-    # model：模型
-    # data：干净数据集
-    # label：干净数据集对应标签
-    # fn_margin：损失函数（默认为slm损失函数，返回原损失）
-    # margin_init：pgd对抗样本的损失（默认为slm损失函数，返回原损失）
-    # maxeps：最大攻击扰动，为论文中的1.05*dmax(形状与y相同)
-    # num_steps：搜索次数
-    # cur_min：当前扰动的最小值，默认为None
-    # clip_min：裁剪的最小值，默认为0.0
-    # clip_max：裁剪的最大值，默认为1.0
-    # 检查当前扰动是否小于最大扰动
-    assert torch.all(cur_eps <= maxeps)
-    # 对抗样本的损失（刚开始为pgd对抗样本的损失，形状与y相同）
-    margin = margin_init
-    # 初始化当前最小扰动的值为0，shape与y相同
-    if cur_min is None:
-        cur_min = torch.zeros_like(margin)
-    # 最大扰动值与maxeps相同，shape与y相同
-    cur_max = maxeps.clone().detach()
-
-    # 进行num_steps次搜索
-    for ii in range(num_steps):
-        # margin < 0代表正确分类,cur_min=max[cur_eps,cur_min],cur_max=min[maxeps,cur_max]
-        # 与论文中的[cur_eps,maxeps]相同
-        # margin >= 0代表错误分类,cur_min=max[0,cur_min],cur_max=min[cur_eps,cur_max]
-        # 与论文中的[0,cur_eps]相同
-        cur_min = torch.max((margin < 0).float() * cur_eps, cur_min)
-        cur_max = torch.min(((margin < 0).float() * maxeps + (margin >= 0).float() * cur_eps), cur_max)
-        # 计算当前添加的扰动大小，更新cur_eps，若正确分类则增大cur_eps的值，错误分类则减小cur_eps的值
-        cur_eps = (cur_min + cur_max) / 2
-        # 计算添加扰动后的对抗样本的slm损失，更新margin
-        margin = fn_margin(model(clamp(data + batch_multiply(cur_eps, ptb), min=clip_min, max=clip_max)), label)
-    # 检查当前添加的扰动是否小于最大扰动dmax
-    assert torch.all(cur_eps <= maxeps)
-    # 返回最佳扰动
-    return cur_eps
-
-# 复制梯度
-class GradCloner(object):
-    def __init__(self, model, optimizer):
-        # model：模型
-        # optimizer：优化器
-        self.model = model
-        self.optimizer = optimizer
-        # clone_model：复制模型
-        self.clone_model = copy.deepcopy(model)
-        # clone_optimizer：设置复制优化器为SGD，lr=0.0
-        self.clone_optimizer = optim.SGD(self.clone_model.parameters(), lr=0.)
-
-    # 复制和清空梯度
-    def copy_and_clear_grad(self):
-        # 初始化复制优化器的梯度为0
-        self.clone_optimizer.zero_grad()
-        # 将复制优化器的梯度赋值为原始优化器的梯度
-        for (pname, pvalue), (cname, cvalue) in zip(self.model.named_parameters(), self.clone_model.named_parameters()):
-            cvalue.grad = pvalue.grad.clone()
-        # 将原始优化器的梯度清空
-        self.optimizer.zero_grad()
-
-    # 更新原始优化器的梯度为组合梯度
-    def combine_grad(self, alpha=1, beta=1):
-        # alpha：原始优化器梯度的系数，默认为1
-        # beta：复制优化器梯度的系数，默认为1
-        for (pname, pvalue), (cname, cvalue) in zip(self.model.named_parameters(), self.clone_model.named_parameters()):
-            # 原始优化器梯度 = alpha*原始优化器的梯度 + beta*复制优化器的梯度
-            pvalue.grad.data = \
-                alpha * pvalue.grad.data + beta * cvalue.grad.data
-
 # 计算平均精度
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -416,7 +344,7 @@ def update_eps_meter(meter, eps, num):
     meter["disp_eps"].update(eps, num)
 
 # MMA防御
-class OriginMMADefense(Defense):
+class DEEPFOOLMMAMART1Defense(Defense):
     def __init__(self, loader, dataname="train", verbose=True, model=None, defense_name=None, dataset=None, training_parameters=None, device=None, **kwargs):
         # model：模型
         # defense_name：防御名称
@@ -428,7 +356,7 @@ class OriginMMADefense(Defense):
         # verbose：默认为True
         # dct_eps：记录当前扰动
         # dct_eps_record：记录每个epoch的扰动
-        super(OriginMMADefense, self).__init__(model=model, defense_name=defense_name)
+        super(DEEPFOOLMMAMART1Defense, self).__init__(model=model, defense_name=defense_name)
         self.model = model
         self.defense_name = defense_name
         self.device = device
@@ -447,23 +375,12 @@ class OriginMMADefense(Defense):
         self.loader.targets = self.loader.targets.to(self.device)
         # self.model.to(self.device)
 
-        # add_clean_loss：是否添加正确分类样本的损失，大于0为True，小于等于0为False
-        self.add_clean_loss = self.clean_loss_coeff > 0
-        # 如果要添加正确分类的损失，则将模型和优化器传入GradCloner中
-        if self.add_clean_loss:
-            self.grad_cloner = GradCloner(self.model, self.optimizer)
-        # 交叉熵损失的原损失
-        self.margin_loss_fn1 =  get_none_loss_fn(self.margin_loss_fn)
         # 交叉损失的平均损失（为loss_fn）
         self.loss_fn = get_mean_loss_fn(self.clean_loss_fn)
-        # SLM损失的原损失
-        self.search_loss_fn1 = get_none_loss_fn(self.search_loss_fn)
         # SLM损失和
         self.train_adv_loss_fn = get_sum_loss_fn(self.attack_loss_fn)
         # 添加的最大扰动
         self.maxeps = self.hinge_maxeps * 1.05
-        # 初始化PGD扰动大小
-        self.mineps = self.attack_mineps
 
         self.adv_meter = init_loss_acc_meter()
         # 将adv放入meters字典中
@@ -501,40 +418,42 @@ class OriginMMADefense(Defense):
         for key in kwargs:
             print('\t{} = {}'.format(key, kwargs[key]))
 
-        # 产生PGD对抗样本的参数(用于训练)
-        # 由nb_iter（迭代次数）、attack_mineps（扰动范围）和eps_iter_scale计算pgd扰动步长
-        self.nb_iter = kwargs['nb_iter']
-        self.attack_mineps = kwargs['attack_mineps']
-        self.eps_iter_scale = kwargs['eps_iter_scale']
+        # 产生DeepFool对抗样本(用于对抗训练)
+        self.max_iters = kwargs['max_iters']
+        self.overshoot = kwargs['overshoot']
         # 产生PGD对抗样本的参数(用于测试)
+        self.nb_iter = kwargs['nb_iter']
         self.test_eps = kwargs['test_eps']
         self.test_eps_iter = kwargs['test_eps_iter']
         # 损失函数
         self.clean_loss_fn = kwargs['clean_loss_fn']
-        self.margin_loss_fn = kwargs['margin_loss_fn']
         self.attack_loss_fn = kwargs['attack_loss_fn']
-        self.search_loss_fn = kwargs['search_loss_fn']
         # ANPGD添加的最大扰动，为论文中的dmax
         self.hinge_maxeps = kwargs['hinge_maxeps']
-        # ANPGD的搜索次数
-        self.num_search_steps = kwargs['num_search_steps']
-        # 损失函数的系数
-        self.clean_loss_coeff = kwargs['clean_loss_coeff']
+        # 损失函数的正则化系数
+        self.lamda = kwargs['lamda']
         # 其他参数
         self.disp_interval = kwargs['disp_interval']
         return True
 
-    # 产生PGD对抗样本
-    def pgd_generation(self, var_natural_images=None, var_natural_labels=None, type='train'):
+    # 产生DeepFool对抗样本，用于对抗训练，返回DeepFool对抗样本和扰动
+    def deepfool_generation(self, var_natural_images, device):
+        attacker = DeepFoolAttack(model=self.model, overshoot=self.overshoot, max_iters=self.overshoot)
+        deepfool_adv = []
+        curr_eps = []
+        for i in range(len(var_natural_images)):
+            adv, perturbation, iteration = attacker.perturbation_single(sample=var_natural_images[i:i+1],device=device)
+            deepfool_adv.extend(adv)
+            curr_eps.extend(perturbation)
+        # 返回DeepFool对抗样本和DeepFool扰动
+        return np.array(deepfool_adv), np.array(curr_eps)
+
+    # 产生PGD对抗样本，返回PGD对抗样本
+    def pgd_generation(self, var_natural_images=None, var_natural_labels=None):
         # var_natural_images：干净样本
         # var_natural_labels：干净样本对应的标签
-        # pgd攻击的迭代步长
-        if type == 'train':
-            pgd_eps_iter = self.eps_iter_scale * self.attack_mineps / self.nb_iter
-            eps = self.attack_mineps
-        if type == 'test':
-            pgd_eps_iter = self.test_eps_iter
-            eps = self.test_eps
+        pgd_eps_iter = self.test_eps_iter
+        eps = self.test_eps
         self.model.eval()
         natural_images = var_natural_images.cpu().numpy()
         # copy_images：复制干净样本numpy形式
@@ -565,55 +484,14 @@ class OriginMMADefense(Defense):
         # 返回最后copy_images的tensor形式，即为PGD对抗样本
         return torch.from_numpy(copy_images).to(self.device)
 
-    # 产生ANPGD对抗样本，用于对抗训练
-    def anpgd_generation(self, prev_eps, var_natural_images=None, var_natural_labels=None):
-        # 产生PGD对抗样本
-        pgd_adv = self.pgd_generation(self, var_natural_images, var_natural_labels, type='train')
-        # 计算PGD对抗样本的方向
-        unitptb = batch_multiply(1. / (prev_eps + 1e-12), (pgd_adv - var_natural_images))
-        self.model.eval()
-        # 计算SLM损失
-        logit_margin = self.search_loss_fn1(self.model(pgd_adv), var_natural_labels)
-        # 最大扰动dmax与var_natural_labels的shape相同
-        maxeps = self.maxeps * torch.ones_like(var_natural_labels).float()
-        # 产生最佳扰动
-        curr_eps = bisection_search(prev_eps, unitptb, self.model, var_natural_images, var_natural_labels, self.search_loss_fn1,
-                                    logit_margin, maxeps, self.num_search_steps)
-        # 产生ANPGD对抗样本
-        pgd_adv = var_natural_images + batch_multiply(curr_eps, unitptb)
-        return pgd_adv, curr_eps
-
-    # 产生ANPGD对抗样本，用于白盒攻击测试
+    # 产生PGD对抗样本和DEEPFOOL扰动，用于白盒攻击测试和选择最佳训练模型
     def anpgd_generation_test(self, var_natural_images=None, var_natural_labels=None):
         # 产生PGD对抗样本
-        pgd_adv = self.pgd_generation(self, var_natural_images, var_natural_labels, type='test')
-        # 计算PGD对抗样本扰动方向
-        unitptb = batch_multiply(1. / (self.test_eps + 1e-12), (pgd_adv - var_natural_images))
-        # 计算LM损失
-        self.model.eval()
-        logit_margin = elementwise_margin(self.model(pgd_adv), var_natural_labels)
-        # 产生与var_natural_labels大小相同全为1的tensor
-        ones = torch.ones_like(var_natural_labels).float()
-        # 最大扰动dmax与var_natural_labels的shape相同
-        maxeps = self.maxeps * ones
-        # 计算最佳扰动，当前扰动设置为最大扰动的一半，loss设置为LMloss
-        curr_eps = bisection_search(maxeps * 0.5, unitptb, self.model, var_natural_images, var_natural_labels,
-                                    elementwise_margin, logit_margin, maxeps, self.num_search_steps)
-        # 返回PGD对抗样本和最佳扰动
+        pgd_adv = self.pgd_generation(self, var_natural_images, var_natural_labels)
+        # 计算DeepFool扰动
+        deepfool_adv, curr_eps = self.deepfool_generation(var_natural_images,self.device)
+        # 返回PGD对抗样本和DEEPFOOL扰动
         return pgd_adv, curr_eps
-
-    # 获取正确分类样本的扰动(初始化为mineps)
-    def get_eps(self, idx, data):
-        # idx：data中正确分类的下标值
-        # data：输入图像
-        lst_eps = []
-        # 遍历idx
-        for ii in idx:
-            ii = ii.item()
-            # lst_eps添加max[攻击中的最小eps,dct_eps设置默认值的最小eps]
-            lst_eps.append(max(self.mineps, self.dct_eps.setdefault(ii, self.mineps)))
-        # 返回lst_eps的tensor形式
-        return data.new_tensor(lst_eps)
 
     # 更新dct_eps为当前扰动值，将每个epoch的扰动值记录在dct_eps_record中
     def update_eps(self, eps, idx):
@@ -659,76 +537,69 @@ class OriginMMADefense(Defense):
         self.model.eval()
         # 经过模型的训练集的logit输出
         clnoutput = self.model(data)
-        # 对干净训练集求平均交叉熵损失
-        clnloss = self.loss_fn(clnoutput, target)
-        # 是否添加净损失
-        if self.add_clean_loss:
-            # 清空优化器梯度
-            self.optimizer.zero_grad()
-            # 反向传播
-            clnloss.backward()
-            # 复制原始优化器梯度，再清空原始优化器梯度
-            self.grad_cloner.copy_and_clear_grad()
-        # 对干净训练集计算SLM原损失
-        search_loss = self.search_loss_fn1(clnoutput, target)
-        # 正确分类的图像slm损失小于0
-        cln_correct = (search_loss < 0)
-        # 错误分类的图像的slm损失大于等于0
-        cln_wrong = (search_loss >= 0)
-        # 获取正确分类的图像
-        data_correct = data[cln_correct]
-        # 获取正确分类的标签
-        target_correct = target[cln_correct]
-        # 获取正确分类的图像在data中的下标
-        idx_correct = idx[cln_correct]
-        # 计算所有分类正确的data数量
-        num_correct = cln_correct.sum().item()
-        # 计算所有错误分类的数量
-        num_wrong = cln_wrong.sum().item()
-        # 初始化当前的扰动为0，shape与len(data)相同
-        curr_eps = data.new_zeros(len(data))
-
-        # 如果正确分类的图片数目大于0
-        if num_correct > 0:
-            # 获取分类正确图片的PGD初始扰动范围
-            prev_eps = self.get_eps(idx_correct, data)
-            # 利用ANPGD，返回ANPGD对抗样本和最佳扰动
-            advdata_correct, curr_eps_correct = self.anpgd_generation(data_correct, target_correct, prev_eps)
-            # 用ANPGD对抗样本替换正确分类的样本，更新data
-            data[cln_correct] = advdata_correct
-            # 更新正确分类样本添加的扰动，错误分类的保持为0
-            curr_eps[cln_correct] = curr_eps_correct
-        # 模型预测输出（正确分类的添加ANPGD扰动后的分类结果，错误分类则为原样本的分类结果）
-        mmaoutput = self.model(data)
-        # 如果没有正确分类的样本，则令正确分类样本的交叉损失熵为0
-        if num_correct == 0:
-            marginloss = mmaoutput.new_zeros(size=(1,))
-        # 否则求正确分类样本添加ANPGD扰动后的交叉熵损失
-        else:
-            marginloss = self.margin_loss_fn1(mmaoutput[cln_correct], target[cln_correct])
-        # 如果错误分类的数量为0，则错误分类的loss为0
-        if num_wrong == 0:
-            clsloss = 0.
-        # 否则为错误分类样本的交叉熵损失
-        else:
-            clsloss = self.loss_fn(mmaoutput[cln_wrong], target[cln_wrong])
-        # 如果有正确分类的样本，仅取小于dmax的扰动的交叉熵损失
-        if num_correct > 0:
-            marginloss = marginloss[self.hinge_maxeps > curr_eps_correct]
-        # 求平均MMA损失
-        mmaloss = (marginloss.sum() + clsloss * num_wrong) / len(data)
-        # 清空梯度
+        # 产生DeepFool对抗样本
+        advdata, curr_eps = self.deepfool_generation(data,self.device)
+        # 预测对抗样本标签
+        advoutput = self.model(advdata)
+        # MART损失函数
+        # 第一个指标函数BCE
+        loss_adv1 = self.loss_fn(advoutput, target)
+        softm_adv = F.softmax(advoutput, dim=1)
+        inf = -float('inf')
+        for i in range(advoutput.shape[0]):
+            advoutput[i][target[i]] = inf
+        _, predicted = torch.max(advoutput.data, 1)
+        predicted = predicted.numpy()
+        one_hot_labels = []
+        for label in predicted:
+            one_hot_label = [0 for i in range(10)]
+            one_hot_label[label] = 1
+            one_hot_labels.append(one_hot_label)
+        one_hot_labels = np.array(one_hot_labels)
+        one_hot_labels = torch.from_numpy(one_hot_labels)
+        log_one = torch.sum(torch.mul(one_hot_labels, softm_adv), dim=1)
+        log_one = torch.ones(log_one.shape) - log_one
+        log_likelihood = -torch.log(log_one)
+        loss_adv11 = torch.mean(log_likelihood)
+        loss_adv_bce = loss_adv1 + loss_adv11
+        # 第二个指标函数BCE
+        loss_nat1 = self.loss_fn(clnoutput, target)
+        softm_nat = F.softmax(clnoutput, dim=1)
+        for i in range(clnoutput.shape[0]):
+            clnoutput[i][target[i]] = inf
+        m, predicted_nat = torch.max(clnoutput.data, 1)
+        predicted_nat = predicted_nat.numpy()
+        one_hot_labels1 = []
+        for label1 in predicted_nat:
+            one_hot_label1 = [0 for i in range(10)]
+            one_hot_label1[label1] = 1
+            one_hot_labels1.append(one_hot_label1)
+        one_hot_labels1 = np.array(one_hot_labels1)
+        one_hot_labels1 = torch.from_numpy(one_hot_labels1)
+        log_one1 = torch.sum(torch.mul(one_hot_labels1, softm_nat), dim=1)
+        log_one1 = torch.ones(log_one1.shape) - log_one1
+        log_likelihood1 = -torch.log(log_one1)
+        loss_nat11 = torch.mean(log_likelihood1)
+        loss_nat_bce = loss_nat1 + loss_nat11
+        # 第三个指标函数
+        one_hot_nat_labels = []
+        for nat_label in target:
+            one_hot_nat_label = [0 for i in range(10)]
+            one_hot_nat_label[nat_label] = 1
+            one_hot_nat_labels.append(one_hot_nat_label)
+        one_hot_nat_labels = np.array(one_hot_nat_labels)
+        one_hot_nat_labels = torch.from_numpy(one_hot_nat_labels)
+        pyi = torch.sum(torch.mul(softm_nat, one_hot_nat_labels), dim=1)
+        loss3 = torch.ones(pyi.shape) - pyi
+        loss3 = torch.mean(loss3)
+        # 总的损失函数
+        loss = loss_adv_bce + self.lamda * loss_nat_bce * loss3
         self.optimizer.zero_grad()
-        # 反向传播
-        mmaloss.backward()
-        # 组合梯度，1/3净损失+2/3MMA损失
-        if self.add_clean_loss:
-            self.grad_cloner.combine_grad(1 - self.clean_loss_coeff, self.clean_loss_coeff)
-        # 梯度更新
+        loss.backward()
         self.optimizer.step()
         # 更新dct_eps和dct_eps_record
         self.update_eps(curr_eps, idx)
-        # 返回经过模型一个batch的logit输出、训练集的平均交叉熵损失和当前扰动（0/ANPGD扰动）
+        # 返回经过模型一个batch的logit输出、训练集的平均交叉熵损失和当前扰动（DeepFool扰动）
         return clnoutput, clnloss, curr_eps
 
     # 初始化meters（OrderedDict会保留字典的添加顺序）
@@ -991,7 +862,7 @@ class OriginMMADefense(Defense):
         for data, idx in loader:
             data, idx = data.to(self.device), idx.to(self.device)
             target = loader.targets[idx]
-            # 获取PGD对抗样本和ANPGD扰动
+            # 获取PGD对抗样本和DeepFool扰动
             advdata, curr_eps = self.anpgd_generation_test(data, target)
             # 更新epoch_eps、disp_eps为curr_eps的平均值
             update_eps_meter(self.eps_meter_test, curr_eps.mean().item(), len(data))
@@ -1010,11 +881,11 @@ class OriginMMADefense(Defense):
                 np.array(list(self.dct_eps_test.values())).mean())
 
     def test_defense(self, validation_loader=None):
-        # 初始化最大ANPGD平均扰动为0.0
+        # 初始化最大DeepFool平均扰动为0.0
         best_avgeps = 0.
         for epoch in range(self.num_epochs):
             self.train_one_epoch()
-            # 验证集的平均精度、白盒攻击PGD对抗样本的平均精度、需要添加的平均ANPGD扰动
+            # 验证集的平均精度、白盒攻击PGD对抗样本的平均精度、需要添加的平均DeepFool扰动
             val_clnacc, val_advacc, val_avgeps = self.test_one_epoch(dataname='valid', loader=validation_loader)
             # 如果是CIFAR10数据集，则调整模型参数
             if self.Dataset == 'CIFAR10':
@@ -1030,37 +901,5 @@ class OriginMMADefense(Defense):
                 self.model.save(name=defense_enhanced_saver)
             else:
                 print('Train Epoch{:>3}: Average correct ANPGD perturbation did not improve from {:.4f}\n'.format(epoch, best_avgeps))
-
-
-
-
-
-
-
-    # # 保存在验证集上最好分类精度的MMA对抗训练模型
-    # def defense(self, validation_loader=None):
-    #     # train_loader：训练集
-    #     # validation_loader：验证集
-    #     # best_val_acc：验证集上的最佳分类精度
-    #     best_val_acc = None
-    #     for epoch in range(self.num_epochs):
-    #         self.train_one_epoch()
-    #         # 计算验证集精度
-    #         val_acc = validation_evaluation(model=self.model, validation_loader=validation_loader, device=self.device)
-    #         # 调整学习率
-    #         if self.Dataset == 'CIFAR10':
-    #             adjust_mma_learning_rate(epoch=epoch, optimizer=self.optimizer)
-    #         # 将最佳模型参数保存到DefenseEnhancedModels/OriginMMA/CIFAR10_OriginMMA_enhanced.pt中或MNIST
-    #         assert os.path.exists('../DefenseEnhancedModels/{}'.format(self.defense_name))
-    #         defense_enhanced_saver = '../DefenseEnhancedModels/{}/{}_{}_enhanced.pt'.format(self.defense_name, self.Dataset, self.defense_name)
-    #         # 将最好的模型参数进行保存
-    #         if not best_val_acc or round(val_acc, 4) >= round(best_val_acc, 4):
-    #             if best_val_acc is not None:
-    #                 os.remove(defense_enhanced_saver)
-    #             best_val_acc = val_acc
-    #             self.model.save(name=defense_enhanced_saver)
-    #         else:
-    #             print('Train Epoch{:>3}: validation dataset accuracy did not improve from {:.4f}\n'.format(epoch, best_val_acc))
-
 
 

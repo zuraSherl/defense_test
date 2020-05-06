@@ -14,8 +14,8 @@ from src.train_cifar10 import MMA_CIFAR10_Training_Parameters
 from src.get_datasets import get_mnist_train_validate_loader
 from src.get_datasets import get_cifar10_train_validate_loader
 
-from Denfenses.DefenseMethods.DEEPFOOL_MMA import DEEPFOOLMMADefense
-from Denfenses.DefenseMethods.DEEPFOOL_MMA import add_indexes_to_loader
+from Denfenses.DefenseMethods.DEEPFOOL_MMA_MART1 import DEEPFOOLMMAMART1Defense
+from Denfenses.DefenseMethods.DEEPFOOL_MMA_MART1 import add_indexes_to_loader
 
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_index
@@ -54,30 +54,28 @@ def main(args):
 
     # defense_name：防御名称
     # nat_params：对抗训练的参数
-    defense_name = 'DeepFoolMMA'
-    deepfoolmma_params = {
+    defense_name = 'DEEPFOOL_MMA_MART1'
+    deepfoolmmamart1_params = {
         'nb_iter': args.nb_iter,
         'max_iters': args.max_iters,
         'overshoot': args.overshoot,
         'test_eps': args.test_eps,
         'test_eps_iter': args.test_eps_iter,
         'clean_loss_fn': args.clean_loss_fn,
-        'margin_loss_fn': args.margin_loss_fn,
         'attack_loss_fn': args.attack_loss_fn,
-        'search_loss_fn': args.search_loss_fn,
         'hinge_maxeps': args.hinge_maxeps,
-        'clean_loss_coeff': args.clean_loss_coeff,
+        'lamda': args.lamda,
         'disp_interval': args.disp_interval
     }
 
-    # 将参数传入OriginMMA防御中
-    deepfoolmma = DEEPFOOLMMADefense(loader=train_loader, dataname="train", verbose=True, model=model_framework, defense_name=defense_name, dataset=dataset, training_parameters=training_parameters, device=device,
-                     **deepfoolmma_params)
+    # 将参数传入DEEPFOOLMMAMART1防御中
+    deepfoolmmamart1 = DEEPFOOLMMAMART1Defense(loader=train_loader, dataname="train", verbose=True, model=model_framework, defense_name=defense_name, dataset=dataset, training_parameters=training_parameters, device=device,
+                     **deepfoolmmamart1_params)
     # 进行对抗训练
-    deepfoolmma.test_defense(validation_loader=valid_loader)
+    deepfoolmmamart1.test_defense(validation_loader=valid_loader)
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='The DeepFoolMMA Defenses')
+    parser = argparse.ArgumentParser(description='The DEEPFOOLMMAMART1 Defenses')
     # dataset：数据集名称MNIST/CIFAR10
     # gpu_index：gpu数量，默认为0
     # seed：随机种子，默认为100
@@ -93,12 +91,9 @@ if __name__ == '__main__':
     parser.add_argument('--test_eps_iter', type=float, default=0.01, help='the parameter for calculating the step length of PGD attacks test')
     # **********自由选择，与数据集无关**********
     parser.add_argument('--clean_loss_fn', type=str, default='xent', help='the loss function')
-    parser.add_argument('--margin_loss_fn', type=str, default='xent', help='the loss function')
     parser.add_argument('--attack_loss_fn', type=str, default='slm', help='the loss function')
-    parser.add_argument('--search_loss_fn', type=str, default='slm', help='the loss function')
     parser.add_argument('--hinge_maxeps', type=float, help='the max ANPGD perturbation')
-    # parser.add_argument('--num_search_steps', type=int, default=10, help='the search times for ANPGD perturbation')
-    parser.add_argument('--clean_loss_coeff', type=float, default=1./3, help='the weight coefficient of loss function')
+    parser.add_argument('--lamda', type=float, default=6.0, help='the regularization coefficient')
     parser.add_argument('--disp_interval', type=int, default=100, help='the output node')
     arguments = parser.parse_args()
     main(arguments)
