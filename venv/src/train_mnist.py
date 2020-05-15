@@ -31,6 +31,15 @@ MMA_MNIST_Training_Parameters ={
     'learning_rate':1e-4
 }
 
+# RLFAT的MNIST训练参数
+RLFAT_MNIST_Training_Parameters ={
+    'num_epochs': 20,
+    'batch_size': 100,
+    'learning_rate': 0.05,
+    'momentum': 0.9,
+    'decay': 1e-6
+}
+
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_index
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

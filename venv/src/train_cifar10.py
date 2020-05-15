@@ -30,6 +30,13 @@ MMA_CIFAR10_Training_Parameters = {
     'decay': 0.0002
 }
 
+# RLFAT的CIFAR10训练参数
+RLFAT_CIFAR10_Training_Parameters = {
+    'num_epochs': 200,
+    'batch_size': 32,
+    'lr': 0.001
+}
+
 # 调整CIFAR10训练过程中的学习率
 def adjust_mma_learning_rate(epoch, optimizer):
     # optimizer.param_groups：优化器对象的超参数
